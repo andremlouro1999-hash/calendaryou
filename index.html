@@ -586,6 +586,12 @@ input,select,textarea{font:inherit;color:inherit}
 .mv-dest{padding:10px 0;border-top:1px solid var(--linha)}
 .mv-dest>span{display:block;font-size:14px;margin-bottom:7px}
 .mv-dest .opcoes .mini{font-size:12px;padding:6px 11px}
+.nv-diag{list-style:none;margin:12px 0 0;padding:11px 12px;background:var(--card);
+  border:1px solid var(--linha);border-radius:12px;
+  font-family:"IBM Plex Mono",monospace;font-size:11.5px;line-height:1.8}
+.nv-diag li{white-space:normal}
+.nv-ok{color:var(--ok)}
+.nv-nao{color:var(--alerta)}
 
 /* Rede de segurança: o app troca de aba pondo `hidden` nas seções. Uma regra
    de layout com seletor de ID vence o `[hidden]` do navegador e a tela nunca
@@ -989,57 +995,107 @@ function lerConfigColada(txt){
 }
 
 const Nuvem = {
-  pronto:false, usuario:null, doc:null, estado:"desligado", ultimoErro:"",
-  ignorarProximo:false,
+  pronto:false, usuario:null, estado:"desligado", ultimoErro:"",
+  sincronizado:false, pendente:null, ultimoEnviado:null, persistencia:"?",
 
   configurada(){ return !!configNuvem(); },
+  sdkCarregado(){ return typeof firebase !== "undefined" && !!firebase.auth; },
 
   async iniciar(){
     const cfg = configNuvem();
-    if(!cfg || typeof firebase === "undefined"){ this.estado = "desligado"; return; }
+    if(!cfg){ this.estado = "desligado"; return; }
+    if(!this.sdkCarregado()){
+      this.estado = "sem-sdk";
+      this.ultimoErro = "O Firebase não carregou. Normalmente é falta de internet na abertura.";
+      return;
+    }
     try{
       firebase.initializeApp(cfg);
       this.db = firebase.firestore();
-      try{ await this.db.enablePersistence({synchronizeTabs:true}); }catch(e){}
+      /* A sessão precisa sobreviver a fechar o app. Se o navegador não deixar
+         guardar (aba anônima, armazenamento bloqueado), é isso que faz você
+         ser desconectado sozinho — então dizemos, em vez de deixar quieto. */
+      try{
+        await firebase.auth().setPersistence(firebase.auth.Auth.Persistence.LOCAL);
+        this.persistencia = "local";
+      }catch(e){
+        this.persistencia = "nenhuma";
+        this.ultimoErro = "Este navegador não deixa guardar a sessão, então você "+
+          "vai precisar entrar de novo a cada abertura.";
+      }
+      /* o modo offline é um extra: se ele falhar ou demorar, o login não pode
+         ficar esperando por ele */
       this.pronto = true;
       this.estado = "deslogado";
+      this.db.enablePersistence({synchronizeTabs:true}).catch(()=>{});
+
       firebase.auth().onAuthStateChanged(u=>{
         this.usuario = u;
         if(u){ this.estado = "ligado"; this.escutar(); }
-        else { this.estado = "deslogado"; }
+        else { this.estado = "deslogado"; this.sincronizado = false; this.ultimoEnviado = null;
+               if(this.parar){ this.parar(); this.parar = null; } }
         if(typeof atualizarSeloNuvem === "function") atualizarSeloNuvem();
       });
-    }catch(e){ this.estado = "erro"; this.ultimoErro = String(e.message || e); }
+    }catch(e){
+      this.estado = "erro";
+      this.ultimoErro = String((e && e.message) || e);
+    }
   },
 
-  ref(){ return this.usuario ? this.db.collection("rotinas").doc(this.usuario.uid) : null; },
+  ref(){ return this.usuario && this.db ? this.db.collection("rotinas").doc(this.usuario.uid) : null; },
 
   escutar(){
     const r = this.ref(); if(!r) return;
     if(this.parar) this.parar();
+    this.sincronizado = false;
     this.parar = r.onSnapshot(snap=>{
+      const primeiro = !this.sincronizado;
+      this.sincronizado = true;
       const remoto = snap.data();
-      if(!remoto || !remoto.json) return;
-      if(this.ignorarProximo){ this.ignorarProximo = false; return; }
-      let vindo;
-      try{ vindo = JSON.parse(remoto.json); }catch(e){ return; }
-      if(fundir(vindo)){
-        try{ localStorage.setItem(CHAVE, JSON.stringify(dados)); }catch(e){}
-        render();
+      /* hasPendingWrites marca o eco da nossa própria gravação. É esse o sinal
+         certo pra ignorar — o contador que eu usava antes engolia, de vez em
+         quando, uma atualização de verdade vinda do outro aparelho. */
+      if(remoto && remoto.json && !snap.metadata.hasPendingWrites){
+        let vindo = null;
+        try{ vindo = JSON.parse(remoto.json); }catch(e){}
+        if(vindo && fundir(vindo)){
+          try{ localStorage.setItem(CHAVE, JSON.stringify(dados)); }catch(e){}
+          render();
+        }
       }
-    }, err=>{ this.estado = "erro"; this.ultimoErro = String(err.message || err);
-              if(typeof atualizarSeloNuvem === "function") atualizarSeloNuvem(); });
+      if(primeiro){
+        /* Só agora sabemos o que existe na nuvem. Mandar antes disso era o que
+           fazia um aparelho recém-ligado passar por cima do outro. */
+        const eu = dados._t || 0, la = (remoto && remoto._t) || 0;
+        if(!snap.exists || eu > la) this.empurrar(dados);
+        else this.pendente = null;
+      }
+      if(typeof atualizarSeloNuvem === "function") atualizarSeloNuvem();
+    }, err=>{
+      this.estado = "erro";
+      this.ultimoErro = String((err && err.message) || err);
+      if(typeof atualizarSeloNuvem === "function") atualizarSeloNuvem();
+    });
   },
 
   empurrar(d){
     const r = this.ref(); if(!r) return;
-    this.ignorarProximo = true;
-    r.set({ json: JSON.stringify(d), _t: d._t || Date.now() })
-     .catch(e=>{ this.ultimoErro = String(e.message || e); });
+    if(!this.sincronizado){ this.pendente = d; return; }   // ainda não conheço a nuvem
+    const json = JSON.stringify(d);
+    if(json === this.ultimoEnviado) return;                // nada novo: evita ping-pong
+    this.ultimoEnviado = json;
+    r.set({ json:json, _t: d._t || Date.now() })
+     .catch(e=>{
+       this.ultimoEnviado = null;
+       this.ultimoErro = String((e && e.message) || e);
+       if(typeof atualizarSeloNuvem === "function") atualizarSeloNuvem();
+     });
   },
 
   async entrar(email, senha, criar){
-    if(!this.pronto) throw new Error("A nuvem não está configurada neste arquivo.");
+    if(!this.configurada()) throw new Error("Falta colar a configuração do Firebase.");
+    if(!this.sdkCarregado()) throw new Error("O Firebase não carregou. Verifique a internet e recarregue a página.");
+    if(!this.pronto) throw new Error(this.ultimoErro || "A nuvem não conseguiu iniciar.");
     if(criar) await firebase.auth().createUserWithEmailAndPassword(email, senha);
     else await firebase.auth().signInWithEmailAndPassword(email, senha);
   },
@@ -3554,15 +3610,27 @@ function textoNuvem(){
   if(!Nuvem.configurada())
     return { cls:"", txt:"Os dados ficam só neste aparelho. Pra usar no celular e no PC ao mesmo "+
       "tempo, cole abaixo a configuração do seu projeto Firebase." };
-  if(typeof firebase === "undefined")
-    return { cls:"erro", txt:"Não consegui carregar o Firebase. Isso costuma ser falta de internet "+
-      "na primeira abertura — os seus dados continuam salvos aqui." };
+  if(Nuvem.estado === "sem-sdk")
+    return { cls:"erro", txt:"O Firebase não carregou nesta abertura — quase sempre é internet. "+
+      "Recarregue a página. Seus dados continuam salvos aqui." };
   if(Nuvem.estado === "erro")
     return { cls:"erro", txt:"A nuvem respondeu com erro: "+Nuvem.ultimoErro };
   if(Nuvem.estado === "ligado")
     return { cls:"", txt:"Sincronizando como "+Nuvem.usuario.email+
-      ". Tudo o que você marca aqui aparece no outro aparelho em segundos." };
+      (Nuvem.sincronizado ? ". Já conversei com a nuvem — o que você marca aqui aparece no outro aparelho em segundos."
+                          : ". Conectando…") };
   return { cls:"", txt:"Entre com o mesmo e-mail nos dois aparelhos e eles passam a mostrar o mesmo dia." };
+}
+/* diagnóstico honesto: em vez de "não entra", diz qual peça está faltando */
+function linhasDiagnostico(){
+  const L = [];
+  L.push(["Configuração colada", Nuvem.configurada()]);
+  L.push(["Firebase carregou", Nuvem.sdkCarregado()]);
+  L.push(["Nuvem iniciada", Nuvem.pronto]);
+  L.push(["Sessão fica guardada", Nuvem.persistencia === "local"]);
+  L.push(["Conta conectada", Nuvem.estado === "ligado"]);
+  L.push(["Já conversou com a nuvem", !!Nuvem.sincronizado]);
+  return L;
 }
 function atualizarSeloNuvem(){
   const el = document.getElementById("nvStatus");
@@ -3577,6 +3645,10 @@ function atualizarSeloNuvem(){
   if(sair) sair.hidden = (Nuvem.estado !== "ligado");
   const trocar = document.getElementById("nvTrocar");
   if(trocar) trocar.hidden = !Nuvem.configurada();
+  const diag = document.getElementById("nvDiag");
+  if(diag) diag.innerHTML = linhasDiagnostico().map(([nome,ok])=>
+    '<li class="'+(ok?"nv-ok":"nv-nao")+'">'+(ok?"✓":"✗")+" "+nome+'</li>').join("")+
+    (Nuvem.ultimoErro ? '<li class="nv-nao">✗ '+esc(Nuvem.ultimoErro)+'</li>' : '');
 }
 function blocoNuvem(){
   return '<div style="margin-top:18px;padding-top:16px;border-top:1px solid var(--linha)">'+
@@ -3597,9 +3669,10 @@ function blocoNuvem(){
       '</div>'+
       '<div class="acoes"><button class="bt forte" id="nvEntrar">Entrar</button>'+
       '<button class="bt" id="nvCriar">Criar conta</button></div>'+
-      '<p class="rg-dica" style="margin-top:8px">A senha protege só os seus dados de rotina. '+
-      'Use uma que você não usa em mais nada.</p>'+
+      '<p class="rg-dica" style="margin-top:8px">Primeira vez num aparelho novo? Use <b>Entrar</b> '+
+      'com a conta que você já criou no outro. <b>Criar conta</b> é só na primeira vez de todas.</p>'+
     '</div>'+
+    '<ul class="nv-diag" id="nvDiag"></ul>'+
     '<div class="acoes"><button class="bt" id="nvSair" hidden>Desconectar deste aparelho</button>'+
     '<button class="bt" id="nvTrocar" hidden>Trocar de projeto Firebase</button></div>'+
   '</div>';
@@ -3608,22 +3681,32 @@ function ligarNuvemUI(){
   atualizarSeloNuvem();
   const msg = m=>{ const el = document.getElementById("nvStatus");
     el.textContent = m; el.classList.add("erro"); };
-  const tentar = async criar=>{
+  const tentar = async (criar, botao)=>{
     const e = (document.getElementById("nvEmail").value || "").trim();
     const s = document.getElementById("nvSenha").value || "";
     if(!e || s.length < 6){ msg("Precisa de um e-mail e uma senha de 6 caracteres ou mais."); return; }
+    const rotulo = botao.textContent;
+    botao.disabled = true; botao.textContent = criar ? "Criando…" : "Entrando…";
     try{ await Nuvem.entrar(e, s, criar); atualizarSeloNuvem(); }
     catch(err){
-      const c = String(err.code || "");
+      const c = String((err && err.code) || "");
       msg(c.indexOf("email-already-in-use") >= 0 ? "Esse e-mail já tem conta — use Entrar."
         : c.indexOf("wrong-password") >= 0 || c.indexOf("invalid-credential") >= 0 ? "Senha ou e-mail não conferem."
         : c.indexOf("user-not-found") >= 0 ? "Não achei essa conta. Use Criar conta."
+        : c.indexOf("invalid-email") >= 0 ? "Esse e-mail não parece válido."
+        : c.indexOf("weak-password") >= 0 ? "A senha precisa de 6 caracteres ou mais."
+        : c.indexOf("too-many-requests") >= 0 ? "Muitas tentativas seguidas. Espere um minuto."
         : c.indexOf("network") >= 0 ? "Sem conexão agora. O app continua funcionando offline."
-        : "Não consegui entrar: "+(err.message || err));
+        : c.indexOf("operation-not-allowed") >= 0 ? "Falta ativar Email/senha em Authentication, no console do Firebase."
+        : "Não consegui entrar: "+((err && err.message) || err));
+      atualizarSeloNuvem !== undefined && document.getElementById("nvDiag") &&
+        (document.getElementById("nvDiag").innerHTML = linhasDiagnostico().map(([nome,ok])=>
+          '<li class="'+(ok?"nv-ok":"nv-nao")+'">'+(ok?"✓":"✗")+" "+nome+'</li>').join(""));
     }
+    finally{ botao.disabled = false; botao.textContent = rotulo; }
   };
-  const be = document.getElementById("nvEntrar"); if(be) be.onclick = ()=>tentar(false);
-  const bc = document.getElementById("nvCriar");  if(bc) bc.onclick = ()=>tentar(true);
+  const be = document.getElementById("nvEntrar"); if(be) be.onclick = ()=>tentar(false, be);
+  const bc = document.getElementById("nvCriar");  if(bc) bc.onclick = ()=>tentar(true, bc);
   const bs = document.getElementById("nvSair");
   if(bs) bs.onclick = async ()=>{ await Nuvem.sair(); atualizarSeloNuvem(); };
 
