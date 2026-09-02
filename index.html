@@ -2319,12 +2319,16 @@ function comRascunho(iso, dow, mutar, fn){
   const reg = iso ? regDe(iso, dow) : null;
   const copiaMud = JSON.parse(JSON.stringify(dados.mudancas || {}));
   const copiaCanc = JSON.parse(JSON.stringify(dados.cancelamentos || {}));
+  const copiaExp = JSON.parse(JSON.stringify(dados.expedientes || {}));
+  const copiaPerfil = dados.perfil ? JSON.parse(JSON.stringify(dados.perfil)) : null;
   try{
     mutar(reg);
     return fn();
   }finally{
     dados.mudancas = copiaMud;
     dados.cancelamentos = copiaCanc;
+    dados.expedientes = copiaExp;
+    if(copiaPerfil) dados.perfil = copiaPerfil; else delete dados.perfil;
     if(reg){
       Object.keys(reg).forEach(k=>delete reg[k]);
       Object.assign(reg, copiaReg);
@@ -2625,6 +2629,94 @@ function aplicarMudanca(id, patch, escopo, iso, dow, destinos){
   render();
 }
 
+/* ═══════════ expediente: aplicar e prever ═══════════ */
+/* Grava a janela nova. Bloco de rotina que você tinha pregado num horário DENTRO do
+   expediente perde só o horário pregado e vai pra depois da saída — senão ele engole
+   horas de trabalho sem você perceber. Quer um bloco no meio do expediente de propósito
+   (passeio na hora do almoço)? Marque a estrela: inegociável fica onde está. */
+function aplicarExpediente(reg, ov, escopo, dow, modo, iso, velha){
+  const idE = dow+":trabalho1", idA = dow+":almoco1";
+  const soltos = [];
+  if(reg) delete reg.ajustes[idE];
+  if(escopo === "hoje"){ reg.expediente = ov; }
+  else{
+    delete dados.mudancas[idE];
+    dados.expedientes = dados.expedientes || {};
+    if(reg) delete reg.expediente;
+    if(escopo === "sempre") dados.expedientes[chaveExp(dow, modo)] = ov;
+    else{
+      delete dados.expedientes[chaveExp(dow, modo)];
+      const P = dados.perfil || JSON.parse(JSON.stringify(PERFIL_PADRAO));
+      if(modo === "presencial"){ P.entrada = ov.entrada; P.almoco = ov.almoco; }
+      else { P.entradaCasa = ov.entrada; P.almocoCasa = ov.almoco; }
+      P.horas = ov.horas;
+      if(ov.acordar && P.acordarFixo){
+        const k = modo === "presencial" ? "acordar" : "acordarCasa";
+        P[k] = ov.acordar;
+      }
+      dados.perfil = P; MODO_PADRAO = calcModos(); GRANA = perfil().grana;
+    }
+  }
+  /* o almoço editado à mão não pode brigar com o almoço da janela nova */
+  const limparAlm = m => { const a = normAjuste(m[idA]); if(!a) return;
+    delete a.dur; if(Object.keys(a).length) m[idA] = a; else delete m[idA]; };
+  if(reg) limparAlm(reg.ajustes); if(escopo !== "hoje") limparAlm(dados.mudancas);
+  /* solta os horários pregados que caíram dentro da janela nova */
+  const E = blocosCrus(dow, modo, iso).find(x=>x.expediente);
+  if(E && velha){
+    const nIni = E.iniM, nFim = E.iniM + E.dur;
+    const dentroNova = m => m >= nIni && m < nFim;
+    /* re-prega logo depois da saída (e do trajeto, se for presencial) */
+    const depoisSaida = hhmm(Math.min(24*60-30, nFim + (modo === "presencial" ? (perfil().trajeto||0) + 15 : 0)));
+    const soltar = mapa => Object.keys(mapa).forEach(id=>{
+      if(id.indexOf(dow+":") !== 0 || id === idE || id === idA) return;
+      const a = normAjuste(mapa[id]); if(!a || !a.ini) return;
+      if((dados.dourados||{})[id]) return;
+      const m = min(a.ini);
+      if(!dentroNova(m)) return;
+      soltos.push({ id, ini:a.ini, para:depoisSaida });
+      a.ini = depoisSaida; mapa[id] = a;
+    });
+    if(reg) soltar(reg.ajustes);
+    if(escopo !== "hoje") soltar(dados.mudancas);
+  }
+  return soltos;
+}
+
+/* o que a janela nova faz com o resto do dia, em português */
+function frasesExpediente(reg, ov, escopo, dow, modo, iso, velha){
+  const antes = planoBase(dow, modo, iso);
+  let soltos = [];
+  const depois = comRascunho(iso, dow, r=>{ soltos = aplicarExpediente(r, ov, escopo, dow, modo, iso, velha); },
+    ()=>planoBase(dow, modo, iso));
+  const f = [];
+  const nome = id => { const b = antes.blocos.find(x=>x.id===id) || antes.fora.find(x=>x.id===id); return b ? b.titulo : id; };
+  soltos.forEach(x=>f.push("“"+nome(x.id)+"” estava pregado às "+x.ini+", dentro do expediente — vai pras "+x.para+", logo depois da saída"));
+  const E = depois.blocos.find(b=>b.expedienteParte) ? depois.trabalho : null;
+  const saidaM = E ? min(E.saida) : null;
+  /* evento especial de hoje: dá tempo de sair, se arrumar e chegar? */
+  if(saidaM !== null && reg) (reg.especiais || []).forEach(e=>{
+    const precisaSair = min(e.ini) - (e.trajeto||0) - (e.preparo||0);
+    if(precisaSair < min(ov.entrada)) return;
+    if(saidaM > precisaSair)
+      f.push("você chega "+dur(saidaM - precisaSair)+" atrasado em “"+e.titulo+"” (precisava sair do trabalho às "+hhmm(precisaSair)+")");
+    else if(precisaSair - saidaM < 60)
+      f.push("“"+e.titulo+"”: sobram só "+dur(precisaSair - saidaM)+" entre a saída e a hora de sair de casa");
+  });
+  if(depois.choques.length > antes.choques.length){
+    const [a,b] = depois.choques[depois.choques.length-1];
+    f.push("cruza com “"+(a.expedienteParte ? b.titulo : a.titulo)+"” — dois horários fixos em cima um do outro");
+  }
+  const perdidos = depois.naoCoube.filter(b=>!antes.naoCoube.some(x=>x.id===b.id) && b.cat !== "trabalho");
+  perdidos.forEach(b=>f.push("“"+b.titulo+"” não cabe mais"));
+  const d1 = horaDeDormir(antes.blocos), d2 = horaDeDormir(depois.blocos);
+  if(d1 !== null && d2 !== null && Math.abs(d2-d1) >= 5)
+    f.push("você deita "+dur(Math.abs(d2-d1))+" mais "+(d2 > d1 ? "tarde" : "cedo"));
+  if(depois.trabalho && depois.trabalho.deficit >= 15)
+    f.push("cabem "+dur(depois.trabalho.total)+" de trabalho, "+dur(depois.trabalho.deficit)+" abaixo da meta");
+  return { frases:f, ruim: f.some(x=>/atrasado|cruza|não cabe/.test(x)) };
+}
+
 /* ═══════════ mover bloco ═══════════ */
 function abrirMover(id){ abrirBloco(id, new Date().getDay(), hojeISO(), null); }
 
@@ -2654,12 +2746,15 @@ function abrirBloco(id, dow, iso, voltar){
     const E = crus.find(x=>x.expediente);
     const ov = expedienteDe(dow, modo, iso);
     const temOv = !!((reg && reg.expediente) || (dados.expedientes || {})[chaveExp(dow, modo)]);
+    /* o almoço que vale é o que está no dia (pode ter sido editado à mão) */
+    const ajA = normAjuste((reg && reg.ajustes[dow+":almoco1"])) || normAjuste(dados.mudancas[dow+":almoco1"]);
     expInfo = {
       entrada: E ? E.ini : (ov.entrada || "08:00"),
       saida:   E ? hhmm(E.iniM + E.dur) : "17:00",
-      almoco:  E ? E.almocoDur : 45,
+      almoco:  (ajA && ajA.dur) || (E ? E.almocoDur : 45),
       alvo:    E ? E.alvo : 480,
-      acordar: crus.length ? crus[0].ini : null
+      acordar: crus.length ? crus[0].ini : null,
+      velha:   E ? { ini:E.iniM, fim:E.iniM + E.dur } : null
     };
     corpo = '<p>'+(iso ? 'Hoje' : 'Toda '+diaNome)+' o expediente vai das <b>'+expInfo.entrada+
       '</b> às <b>'+expInfo.saida+'</b>, com '+dur(expInfo.almoco)+' de almoço — '+dur(expInfo.alvo)+
@@ -2671,6 +2766,7 @@ function abrirBloco(id, dow, iso, voltar){
       '<label class="campo"><span>Almoço (min)</span>'+
         '<input type="number" id="exAlm" min="0" step="5" value="'+expInfo.almoco+'"></label>'+
       '<p class="status" id="exResumo"></p>'+
+      '<div id="exPrevia"></div>'+
       (expInfo.acordar ? '<div class="acoes" style="margin-bottom:10px"><button class="bt" id="exManha">'+
         '☐ Mover a manhã junto (acordar na mesma distância da entrada)</button></div>' : '')+
       '<div class="acoes">'+
@@ -2741,14 +2837,31 @@ function abrirBloco(id, dow, iso, voltar){
       let janela = min(sai) - min(ent); if(janela <= 0) janela += 24*60;
       return { ent, sai, alm, janela, horas:(janela - alm)/60, delta:min(ent) - min(expInfo.entrada) };
     };
+    const montarOv = x => {
+      const ov = { entrada:x.ent, horas:Math.round(x.horas*100)/100, almoco:x.alm };
+      if(moverManha && expInfo.acordar) ov.acordar = hhmm(Math.max(3*60, min(expInfo.acordar) + x.delta));
+      return ov;
+    };
+    expInfo.montarOv = montarOv;
     const resumir = ()=>{
-      const el = document.getElementById("exResumo"), x = lerExp();
-      if(!x){ el.textContent = ""; return; }
-      if(x.horas < 0.5){ el.textContent = "Entre entrada e saída não sobra tempo de trabalho."; el.classList.add("erro"); return; }
+      const el = document.getElementById("exResumo"), pv = document.getElementById("exPrevia"), x = lerExp();
+      if(!x){ el.textContent = ""; pv.innerHTML = ""; return; }
+      if(x.horas < 0.5){ el.textContent = "Entre entrada e saída não sobra tempo de trabalho."; el.classList.add("erro"); pv.innerHTML = ""; return; }
       el.classList.remove("erro");
       el.textContent = dur(Math.round(x.horas*60))+" de trabalho"+
         (Math.abs(Math.round(x.horas*60) - expInfo.alvo) >= 15 ? " (era "+dur(expInfo.alvo)+")" : "")+
         (moverManha && expInfo.acordar ? " · acorda "+hhmm(Math.max(3*60, min(expInfo.acordar) + x.delta)) : "");
+      pv.innerHTML = '<p class="mv-carregando">Recalculando o dia…</p>';
+      setTimeout(()=>{
+        let r;
+        try{ r = frasesExpediente(reg, montarOv(x), iso ? "hoje" : "sempre", dow, modo, iso, expInfo.velha); }
+        catch(e){ pv.innerHTML = ""; return; }
+        const mudou = x.ent !== expInfo.entrada || x.sai !== expInfo.saida || x.alm !== expInfo.almoco || moverManha;
+        if(!mudou && !r.frases.length){ pv.innerHTML = ""; return; }
+        pv.innerHTML = '<div class="mv-previa"><span class="mv-selo '+(r.ruim ? "mv-ruim" : r.frases.length ? "mv-medio" : "mv-bom")+'">'+
+          (r.ruim ? "atenção" : r.frases.length ? "muda o resto" : "cabe inteiro")+'</span>'+
+          (r.frases.length ? '<p>'+esc(r.frases.join("; "))+'.</p>' : '<p>O resto do dia só desliza junto.</p>')+'</div>';
+      }, 10);
     };
     ["exEnt","exSai","exAlm"].forEach(k=>document.getElementById(k).addEventListener("change", resumir));
     const bm = document.getElementById("exManha");
@@ -2795,30 +2908,9 @@ function abrirBloco(id, dow, iso, voltar){
     else if(a === "exp-hoje" || a === "exp-sempre" || a === "exp-perfil"){
       const x = expInfo && expInfo.ler ? expInfo.ler() : null;
       if(!x || x.horas < 0.5) return;
-      const ov = { entrada:x.ent, horas:Math.round(x.horas*100)/100, almoco:x.alm };
-      if(moverManha && expInfo.acordar) ov.acordar = hhmm(Math.max(3*60, min(expInfo.acordar) + x.delta));
-      /* uma janela nova substitui o "fico até X" antigo, senão os dois se somam */
-      const idE = dow+":trabalho1";
-      if(reg) delete reg.ajustes[idE];
-      if(a === "exp-hoje"){ reg.expediente = ov; }
-      else{
-        delete dados.mudancas[idE];
-        dados.expedientes = dados.expedientes || {};
-        if(reg) delete reg.expediente;
-        if(a === "exp-sempre") dados.expedientes[chaveExp(dow, modo)] = ov;
-        else{
-          delete dados.expedientes[chaveExp(dow, modo)];
-          const P = dados.perfil || JSON.parse(JSON.stringify(PERFIL_PADRAO));
-          if(modo === "presencial"){ P.entrada = x.ent; P.almoco = x.alm; }
-          else { P.entradaCasa = x.ent; P.almocoCasa = x.alm; }
-          P.horas = ov.horas;
-          if(moverManha && P.acordarFixo && expInfo.acordar){
-            const k = modo === "presencial" ? "acordar" : "acordarCasa";
-            P[k] = hhmm(Math.max(3*60, min(P[k]) + x.delta));
-          }
-          dados.perfil = P; MODO_PADRAO = calcModos(); GRANA = perfil().grana;
-        }
-      }
+      const escopoE = a === "exp-hoje" ? "hoje" : a === "exp-sempre" ? "sempre" : "perfil";
+      aplicarExpediente(reg, expInfo.montarOv(x), escopoE, dow, modo, iso, expInfo.velha);
+      if(reg){ reg.replanEm = null; reg.resgatados = []; }
     }
     else if(a === "salvar-hoje" || a === "salvar-sempre"){
       const campoT = document.getElementById("edTit");
@@ -2924,7 +3016,10 @@ function expandirExpediente(arr, dia, ajAlmoco){
   const deficit = Math.max(0, E.alvo - total);
   if(blocos.length){
     const ultimo = blocos[blocos.length-1];
-    ultimo.nota = "Fim do expediente às "+hhmm(ultimo.iniM + ultimo.dur)+"."+
+    const fimUlt = ultimo.iniM + ultimo.dur;
+    ultimo.nota = (fimUlt < fim - 4
+      ? "Este pedaço vai até "+hhmm(fimUlt)+"; sua saída é às "+hhmm(fim)+"."
+      : "Saída às "+hhmm(fim)+".")+
       (deficit >= 15 ? " Hoje deu "+dur(total)+" de trabalho, "+dur(deficit)+" a menos." : "");
     if(blocos[0] !== ultimo) blocos[0].nota = "Meta do dia: "+dur(E.alvo)+" de trabalho.";
   }
