@@ -64,6 +64,7 @@ function calcModos(){
 }
 let MODO_PADRAO = calcModos();
 let GRANA = perfil().grana;
+const temGrana = () => !!(GRANA && GRANA.mensal > 0 && GRANA.diaria > 0);
 
 /* Cada categoria tem uma cor para o tema claro e outra para o escuro,
    escolhidas pra manter contraste nos dois. */
@@ -86,7 +87,9 @@ const HABITOS = [
   { key:"mestrado", nome:"Mestrado" },
   { key:"reset",    nome:"Reset da casa" },
   { key:"kit",      nome:"Kit de amanhã" },
-  { key:"treino",   nome:"Treino do Tolstoi" }
+  { key:"treino",   nome:"Treino do Tolstoi" },
+  { key:"faxina",   nome:"Faxina da semana" },
+  { key:"prep",     nome:"Prep da semana" }
 ];
 </script>
 
@@ -783,8 +786,9 @@ function Dia(){
   return api;
 }
 
-function montarDia(dia, modo){
+function montarDia(dia, modo, over){
   const P = perfil();
+  const OV = over || {};   // expediente editado só hoje / só neste dia da semana
   const d = Dia();
   const tipo = modo || (P.dias[dia] === "escritorio" ? "presencial" : P.dias[dia] === "casa" ? "casa" : null);
   const pres = tipo === "presencial";
@@ -792,7 +796,7 @@ function montarDia(dia, modo){
   const petNome = temPet ? (P.pet.nome || "o cachorro") : "";
   const fixosHoje = (P.fixos || []).filter(f => (f.dias||[]).includes(dia))
     .slice().sort((a,b)=>min(a.ini)-min(b.ini));
-  const entradaDia = (modo || (P.dias[dia]==="escritorio"?"presencial":"casa")) === "presencial" ? P.entrada : P.entradaCasa;
+  const entradaDia = OV.entrada || ((modo || (P.dias[dia]==="escritorio"?"presencial":"casa")) === "presencial" ? P.entrada : P.entradaCasa);
   const fixosAntes = fixosHoje.filter(f => min(f.ini) < min(entradaDia));
   const fixosDepois = fixosHoje.filter(f => min(f.ini) >= min(entradaDia));
   const petNoFixo = fixosHoje.some(f => f.cat === "tolstoi");
@@ -803,12 +807,13 @@ function montarDia(dia, modo){
   /* ───── manhã ───── */
   const petManha  = temPet ? (pres ? P.pet.manha : P.pet.manhaCasa) : 0;
   const arrumar   = pres ? P.arrumar : P.banho;
-  const entrada   = pres ? P.entrada : P.entradaCasa;
+  const entrada   = OV.entrada || (pres ? P.entrada : P.entradaCasa);
   const trajeto   = pres ? P.trajeto : 0;
   const precisa   = 10 + petManha + (temPet ? P.pet.treino : 0) + arrumar + P.cafe + (temPet && pres ? 5 : 0) + trajeto;
   let acordar   = P.acordarFixo
     ? (pres ? P.acordar : P.acordarCasa)
     : hhmm(Math.max(0, min(entrada) - precisa));
+  if(OV.acordar) acordar = OV.acordar;   // "mover a manhã junto" ao editar o expediente
   /* compromisso antes do trabalho puxa o despertador junto */
   if(fixosAntes.length){
     const antesPrecisa = 10 + petManha + (temPet ? P.pet.treino : 0) + arrumar + P.cafe
@@ -840,10 +845,13 @@ function montarDia(dia, modo){
 
   /* ───── trabalho: uma janela (entrada → saída) com uma carga a cumprir.
      Os blocos reais são calculados depois, contornando o que for fixo no meio. ───── */
-  const almoco  = pres ? P.almoco : P.almocoCasa;
-  const saida   = min(entrada) + P.horas*60 + 60;
+  const almoco  = OV.almoco !== undefined ? OV.almoco : (pres ? P.almoco : P.almocoCasa);
+  const horas   = OV.horas || P.horas;
+  /* a janela é exatamente entrada → saída: horas de trabalho + almoço.
+     (antes somava 60 min fixos, ignorando o almoço configurado) */
+  const saida   = min(entrada) + Math.round(horas*60) + almoco;
   d.ancora(entrada, saida - min(entrada), "Trabalho", "trabalho",
-    { prio:"essencial", expediente:true, alvo:P.horas*60, almocoDur:almoco });
+    { prio:"essencial", expediente:true, alvo:Math.round(horas*60), almocoDur:almoco });
 
   /* ───── noite ───── */
   if(pres) d.add(P.trajeto, "Trajeto de volta", "trajeto", { prio:"essencial", min:Math.max(10, P.trajeto-5) })
@@ -1119,14 +1127,14 @@ function fundir(remoto){
 
   if((remoto._t || 0) > (dados._t || 0)){
     ["pilha","extras"].forEach(k=>{ if(remoto[k]){ dados[k] = remoto[k]; mudou = true; } });
-    ["mudancas","cancelamentos","agenda","dourados"].forEach(k=>{
+    ["mudancas","cancelamentos","agenda","dourados","expedientes"].forEach(k=>{
       if(remoto[k]){ dados[k] = remoto[k]; mudou = true; } });
     if(remoto.perfil){ dados.perfil = remoto.perfil; MODO_PADRAO = calcModos(); GRANA = perfil().grana; mudou = true; }
     dados._t = remoto._t;
   }
   return mudou;
 }
-let dados = { registro:{}, pilha:[], extras:[], mudancas:{}, cancelamentos:{}, agenda:{}, dourados:{}, tutorial:false };
+let dados = { registro:{}, pilha:[], extras:[], mudancas:{}, cancelamentos:{}, agenda:{}, dourados:{}, expedientes:{}, tutorial:false };
 let salvando = null, pendente = false;
 /* carimba o dia mexido: é isso que deixa a fusão entre celular e PC saber
    qual das duas versões daquele dia é a mais recente */
@@ -1185,10 +1193,18 @@ function alinharAoFim(arr){
 /* um ajuste pode mudar a hora, a duração, ou as duas */
 const normAjuste = v => !v ? null : (typeof v === "string" ? { ini:v } : v);
 
+/* expediente editado: o de hoje (registro) manda sobre o do dia da semana (expedientes) */
+const chaveExp = (dia, modo) => dia+":"+(modo || "");
+function expedienteDe(dia, modo, iso){
+  const semana = (dados.expedientes || {})[chaveExp(dia, modo)] || {};
+  const hoje = iso ? ((dados.registro[iso] || {}).expediente || {}) : {};
+  return Object.assign({}, semana, hoje);
+}
+
 function blocosCrus(dia, modo, iso){
   const cont = {};
   /* a rotina sai em ordem narrativa (acordar → ... → dormir) e essa ordem é a verdade */
-  const arr = montarDia(dia, modo).map(b=>{
+  const arr = montarDia(dia, modo, expedienteDe(dia, modo, iso)).map(b=>{
     const s = slug(b.titulo); cont[s] = (cont[s]||0)+1;
     return {...b, id: dia+":"+s+cont[s], sono: b.titulo === "Dormir" };
   });
@@ -1653,13 +1669,14 @@ function granaDoMes(){
 function renderMetas(){
   const reg = regDe(hojeISO(), new Date().getDay());
   const g = granaDoMes();
-  const pct = Math.min(100, Math.round(g.total/GRANA.mensal*100));
-  const total = reg.metas.length + 1;
-  const feitas = reg.metas.filter(m=>m.ok).length + (reg.grana?1:0);
+  const comGrana = temGrana();
+  const pct = comGrana ? Math.min(100, Math.round(g.total/GRANA.mensal*100)) : 0;
+  const total = reg.metas.length + (comGrana?1:0);
+  const feitas = reg.metas.filter(m=>m.ok).length + (comGrana && reg.grana?1:0);
   let h = '<div class="metas"><div class="metas-topo"><h3>Metas de hoje</h3>'+
     '<span class="metas-conta"><b>'+feitas+'</b> de '+total+'</span></div>';
 
-  h += '<div class="meta-row meta-grana '+(reg.grana?"ok":"")+'" data-grana="1">'+
+  if(comGrana) h += '<div class="meta-row meta-grana '+(reg.grana?"ok":"")+'" data-grana="1">'+
     '<button class="caixa" style="'+(reg.grana?"background:var(--sinal-2);border-color:var(--sinal-2)":"")+'" aria-label="Marcar economia">'+CHECK+'</button>'+
     '<span class="meta-txt">Guardar <b>'+GRANA.moeda+' '+GRANA.diaria+'</b> hoje'+
     '<span class="grana-barra"><i style="width:'+pct+'%"></i></span>'+
@@ -1678,7 +1695,8 @@ function renderMetas(){
   document.getElementById("metasBox").innerHTML = h;
 
   const box = document.getElementById("metasBox");
-  box.querySelector("[data-grana]").onclick = ()=>{ reg.grana = !reg.grana; salvar(); renderMetas(); };
+  const bg = box.querySelector("[data-grana]");
+  if(bg) bg.onclick = ()=>{ reg.grana = !reg.grana; salvar(); renderMetas(); };
   box.querySelectorAll("[data-meta]").forEach(row=>{
     row.querySelectorAll("[data-acao]").forEach(b=>b.onclick = e=>{
       e.stopPropagation();
@@ -1709,10 +1727,10 @@ function resumoDoDia(iso){
   const imps = reg.imprevistos || [];
   const esps = reg.especiais || [];
   const metas = reg.metas || [];
-  const metasOk = metas.filter(m=>m.ok).length + (reg.grana?1:0);
-  const metasTot = metas.length + 1;
+  const metasOk = metas.filter(m=>m.ok).length + (temGrana() && reg.grana?1:0);
+  const metasTot = metas.length + (temGrana()?1:0);
   const bs = blocos.find(b=>b.sono);
-  const sono = bs ? (24*60 - bs.iniM) + acordaAmanha(dow) : null;
+  const sono = bs ? (24*60 - bs.iniM) + acordaAmanha(dow, iso) : null;
 
   const frases = [];
   frases.push(MODO_PADRAO[dow] ? (modo === "presencial" ? "Dia de escritório." : "Trabalho em casa.") : "Dia livre.");
@@ -2626,16 +2644,45 @@ function abrirBloco(id, dow, iso, voltar){
   const ehExtra = !!orig.extra;
   const dourado = !!(dados.dourados || {})[id];
 
-  let corpo;
+  let corpo, expInfo = null, moverManha = false;
   if(estaFora){
     corpo = '<p>Este bloco está fora — o resto da rotina já se reorganizou sem ele.</p>'+
       '<div class="acoes"><button class="bt forte" data-acao="restaurar">Trazer de volta</button></div>';
   }else if(b.expedienteParte){
-    corpo = '<p>Este é um pedaço do seu expediente. Ele não tem hora própria: '+
-      'é o que sobra da janela de trabalho depois de descontar o que estiver fixo no meio dela '+
-      '(reunião, almoço, consulta, imprevisto).</p>'+
-      '<p>Pra mudar isso, mexa na janela inteira — em <b>Refazer minha rotina</b>, na entrada e nas '+
-      'horas por dia — ou mova o compromisso que está no meio do expediente.</p>';
+    /* editar a janela inteira do expediente (entrada, saída, almoço) */
+    const crus = blocosCrus(dow, modo, iso);
+    const E = crus.find(x=>x.expediente);
+    const ov = expedienteDe(dow, modo, iso);
+    const temOv = !!((reg && reg.expediente) || (dados.expedientes || {})[chaveExp(dow, modo)]);
+    expInfo = {
+      entrada: E ? E.ini : (ov.entrada || "08:00"),
+      saida:   E ? hhmm(E.iniM + E.dur) : "17:00",
+      almoco:  E ? E.almocoDur : 45,
+      alvo:    E ? E.alvo : 480,
+      acordar: crus.length ? crus[0].ini : null
+    };
+    corpo = '<p>'+(iso ? 'Hoje' : 'Toda '+diaNome)+' o expediente vai das <b>'+expInfo.entrada+
+      '</b> às <b>'+expInfo.saida+'</b>, com '+dur(expInfo.almoco)+' de almoço — '+dur(expInfo.alvo)+
+      ' de trabalho. Reunião, consulta ou imprevisto no meio continuam sendo descontados.</p>'+
+      '<div class="linha-campos"><label class="campo"><span>Entrada</span>'+
+        '<input type="time" id="exEnt" value="'+expInfo.entrada+'"></label>'+
+        '<label class="campo"><span>Saída</span>'+
+        '<input type="time" id="exSai" value="'+expInfo.saida+'"></label></div>'+
+      '<label class="campo"><span>Almoço (min)</span>'+
+        '<input type="number" id="exAlm" min="0" step="5" value="'+expInfo.almoco+'"></label>'+
+      '<p class="status" id="exResumo"></p>'+
+      (expInfo.acordar ? '<div class="acoes" style="margin-bottom:10px"><button class="bt" id="exManha">'+
+        '☐ Mover a manhã junto (acordar na mesma distância da entrada)</button></div>' : '')+
+      '<div class="acoes">'+
+        (iso ? '<button class="bt forte" data-acao="exp-hoje">Salvar · só hoje</button>' : '')+
+        '<button class="bt'+(iso?'':' forte')+'" data-acao="exp-sempre">Salvar · toda '+diaNome+
+          (modo ? ' '+(modo==="presencial"?"presencial":"em casa") : '')+'</button>'+
+        '<button class="bt" data-acao="exp-perfil">Salvar pra todos os dias '+
+          (modo==="presencial"?"presenciais":"em casa")+'</button>'+
+      '</div>'+
+      (temOv ? '<div class="acoes" style="margin-top:10px"><button class="bt" data-acao="exp-restaurar">Voltar ao padrão</button></div>' : '')+
+      '<p class="rg-dica" style="margin-top:10px">Se sair menos horas de trabalho do que a sua meta, '+
+      'o app avisa em vez de esconder — como já faz quando você chega atrasado.</p>';
   }else{
     corpo = '<p>'+(iso ? 'Hoje' : 'Toda '+diaNome)+' começa às '+b.ini+' e dura '+dur(b.dur)+'. '+
       'Mude a hora, a duração, ou tire do dia — o resto se reorganiza respeitando os horários fixos.</p>'+
@@ -2686,10 +2733,35 @@ function abrirBloco(id, dow, iso, voltar){
     campoH0.addEventListener("change", repintar);
     campoD0.addEventListener("change", repintar);
   }
+  if(expInfo){
+    const lerExp = ()=>{
+      const ent = document.getElementById("exEnt").value, sai = document.getElementById("exSai").value;
+      const alm = Math.max(0, Number(document.getElementById("exAlm").value) || 0);
+      if(!ent || !sai) return null;
+      let janela = min(sai) - min(ent); if(janela <= 0) janela += 24*60;
+      return { ent, sai, alm, janela, horas:(janela - alm)/60, delta:min(ent) - min(expInfo.entrada) };
+    };
+    const resumir = ()=>{
+      const el = document.getElementById("exResumo"), x = lerExp();
+      if(!x){ el.textContent = ""; return; }
+      if(x.horas < 0.5){ el.textContent = "Entre entrada e saída não sobra tempo de trabalho."; el.classList.add("erro"); return; }
+      el.classList.remove("erro");
+      el.textContent = dur(Math.round(x.horas*60))+" de trabalho"+
+        (Math.abs(Math.round(x.horas*60) - expInfo.alvo) >= 15 ? " (era "+dur(expInfo.alvo)+")" : "")+
+        (moverManha && expInfo.acordar ? " · acorda "+hhmm(Math.max(3*60, min(expInfo.acordar) + x.delta)) : "");
+    };
+    ["exEnt","exSai","exAlm"].forEach(k=>document.getElementById(k).addEventListener("change", resumir));
+    const bm = document.getElementById("exManha");
+    if(bm) bm.onclick = ()=>{ moverManha = !moverManha; bm.classList.toggle("forte", moverManha);
+      bm.textContent = (moverManha?"☑":"☐")+" Mover a manhã junto (acordar na mesma distância da entrada)"; resumir(); };
+    resumir();
+    expInfo.ler = lerExp;
+  }
 
   function aplicar(patch, escopo, destinos){
     const alvo = (escopo === "sempre" || !reg) ? dados.mudancas : reg.ajustes;
-    if(Object.keys(patch).length) alvo[id] = patch; else delete alvo[id];
+    /* funde com o que já existia: renomear não pode apagar uma mudança de hora anterior */
+    if(Object.keys(patch).length) alvo[id] = Object.assign({}, normAjuste(alvo[id]) || {}, patch);
     if(escopo === "sempre" && reg) delete reg.ajustes[id];
     (destinos || []).forEach(d=>{
       if(d.destino === "pilha"){
@@ -2715,6 +2787,38 @@ function abrirBloco(id, dow, iso, voltar){
     if(a === "restaurar"){
       delete dados.mudancas[id]; delete dados.cancelamentos[id];
       if(reg){ delete reg.ajustes[id]; reg.cancelados = reg.cancelados.filter(x=>x!==id); }
+    }
+    else if(a === "exp-restaurar"){
+      if(reg) delete reg.expediente;
+      if(dados.expedientes) delete dados.expedientes[chaveExp(dow, modo)];
+    }
+    else if(a === "exp-hoje" || a === "exp-sempre" || a === "exp-perfil"){
+      const x = expInfo && expInfo.ler ? expInfo.ler() : null;
+      if(!x || x.horas < 0.5) return;
+      const ov = { entrada:x.ent, horas:Math.round(x.horas*100)/100, almoco:x.alm };
+      if(moverManha && expInfo.acordar) ov.acordar = hhmm(Math.max(3*60, min(expInfo.acordar) + x.delta));
+      /* uma janela nova substitui o "fico até X" antigo, senão os dois se somam */
+      const idE = dow+":trabalho1";
+      if(reg) delete reg.ajustes[idE];
+      if(a === "exp-hoje"){ reg.expediente = ov; }
+      else{
+        delete dados.mudancas[idE];
+        dados.expedientes = dados.expedientes || {};
+        if(reg) delete reg.expediente;
+        if(a === "exp-sempre") dados.expedientes[chaveExp(dow, modo)] = ov;
+        else{
+          delete dados.expedientes[chaveExp(dow, modo)];
+          const P = dados.perfil || JSON.parse(JSON.stringify(PERFIL_PADRAO));
+          if(modo === "presencial"){ P.entrada = x.ent; P.almoco = x.alm; }
+          else { P.entradaCasa = x.ent; P.almocoCasa = x.alm; }
+          P.horas = ov.horas;
+          if(moverManha && P.acordarFixo && expInfo.acordar){
+            const k = modo === "presencial" ? "acordar" : "acordarCasa";
+            P[k] = hhmm(Math.max(3*60, min(P[k]) + x.delta));
+          }
+          dados.perfil = P; MODO_PADRAO = calcModos(); GRANA = perfil().grana;
+        }
+      }
     }
     else if(a === "salvar-hoje" || a === "salvar-sempre"){
       const campoT = document.getElementById("edTit");
@@ -2848,9 +2952,9 @@ function horaDeDormir(blocos){
   const b = blocos.filter(x=>x.sono).pop();
   return b ? b.iniM : null;
 }
-function acordaAmanha(dow){
-  const d = new Date(); d.setDate(d.getDate()+1);
-  const prox = (dow+1)%7, iso = isoDe(d);
+function acordaAmanha(dow, isoBase){
+  const d = isoBase ? new Date(isoBase+"T12:00:00") : new Date(); d.setDate(d.getDate()+1);
+  const prox = d.getDay(), iso = isoDe(d);
   /* usa o que já está marcado pra amanhã: modo trocado, evento especial, bloco cancelado */
   const p = planoBase(prox, modoDe(iso, prox), iso).blocos[0];
   return p ? p.iniM : 6*60;
@@ -3056,7 +3160,8 @@ function abrirSetup(passo){
     '<h3>'+p.t+'</h3><p>'+p.d+'</p>'+p.html+
     '<div class="tut-pontos" style="margin-top:16px">'+passos.map((x,k)=>'<i class="'+(k===passo?"on":"")+'"></i>').join("")+'</div>'+
     '<div class="acoes"><button class="bt forte" id="swProx">'+(ultimo?"Montar minha rotina":"Próximo")+'</button>'+
-    (passo ? '<button class="bt" id="swVolta">Voltar</button>' : '')+'</div>'+
+    (passo ? '<button class="bt" id="swVolta">Voltar</button>' : '')+
+    (!ultimo && dados.tutorial ? '<button class="bt" id="swSalvar">Salvar já</button>' : '')+'</div>'+
     '<button class="fechar" id="swPular">Usar a rotina de exemplo</button></div></div>';
 
   /* interações de cada passo */
@@ -3117,9 +3222,7 @@ function abrirSetup(passo){
       P.grana = { mensal:m, diaria: m ? Math.max(1, Math.round(m/25)) : 0, moeda:P.grana.moeda }; }
   }
 
-  document.getElementById("swProx").onclick = ()=>{
-    guardar(passo);
-    if(!ultimo) return abrirSetup(passo+1);
+  const concluir = ()=>{
     dados.perfil = JSON.parse(JSON.stringify(P));
     dados.tutorial = true;
     MODO_PADRAO = calcModos(); GRANA = perfil().grana;
@@ -3128,6 +3231,13 @@ function abrirSetup(passo){
     document.getElementById("sheetBox").innerHTML = "";
     render();
   };
+  document.getElementById("swProx").onclick = ()=>{
+    guardar(passo);
+    if(!ultimo) return abrirSetup(passo+1);
+    concluir();
+  };
+  /* mudou só uma coisa? não precisa passar pelos 7 passos */
+  lig("swSalvar", ()=>{ guardar(passo); concluir(); });
   lig("swVolta", ()=>{ guardar(passo); abrirSetup(passo-1); });
   document.getElementById("swPular").onclick = ()=>{
     dados.tutorial = true; rascunho = null; salvar();
@@ -3365,6 +3475,38 @@ function abrirImprevisto(){
     document.getElementById("sheetBox").innerHTML = "";
     renderHoje(); window.scrollTo({top:0,behavior:"smooth"});
   };
+}
+
+/* ═══════════ exportar o dia pro calendário (.ics) ═══════════ */
+function exportarICS(){
+  const dow = new Date().getDay(), iso = hojeISO(), reg = regDe(iso, dow);
+  const { blocos } = planoBase(dow, reg.modo, iso);
+  const { plano } = montarPlano(blocos, reg.replanEm, reg.feitos, reg.resgatados);
+  sanear(plano);
+  const vivos = plano.filter(b=>!b.adiado && !b.pulado && b.ini2 !== null && b.ini2 !== undefined);
+  const pad = n => String(n).padStart(2,"0");
+  const carimbo = m => { const d = new Date(iso+"T00:00:00"); d.setMinutes(m);
+    return d.getFullYear()+pad(d.getMonth()+1)+pad(d.getDate())+"T"+pad(d.getHours())+pad(d.getMinutes())+"00"; };
+  const txt = v => String(v).replace(/\\/g,"\\\\").replace(/;/g,"\\;").replace(/,/g,"\\,").replace(/\n/g,"\\n");
+  const L = ["BEGIN:VCALENDAR","VERSION:2.0","PRODID:-//CalendarYou//PT-BR","CALSCALE:GREGORIAN"];
+  vivos.forEach(b=>{
+    L.push("BEGIN:VEVENT",
+      "UID:cy-"+iso+"-"+b.id.replace(/[^a-z0-9]/gi,"-")+"@calendaryou",
+      "DTSTAMP:"+carimbo(agoraMin()),
+      "DTSTART:"+carimbo(b.ini2), "DTEND:"+carimbo(b.ini2 + b.dur2),
+      "SUMMARY:"+txt(b.titulo),
+      "CATEGORIES:"+txt(rotulo(b.cat)));
+    if(b.nota) L.push("DESCRIPTION:"+txt(b.nota));
+    L.push("END:VEVENT");
+  });
+  L.push("END:VCALENDAR");
+  try{
+    const blob = new Blob([L.join("\r\n")], {type:"text/calendar"});
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob); a.download = "calendaryou-"+iso+".ics";
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(()=>URL.revokeObjectURL(a.href), 2000);
+  }catch(e){ alert("O navegador bloqueou o download."); }
 }
 
 /* ═══════════ dia especial ═══════════ */
@@ -3809,6 +3951,8 @@ function abrirBackup(){
     dados.cancelamentos = novo.cancelamentos || {};
     dados.agenda = novo.agenda || {};
     dados.dourados = novo.dourados || {};
+    dados.expedientes = novo.expedientes || {};
+    if(novo.perfil){ dados.perfil = novo.perfil; MODO_PADRAO = calcModos(); GRANA = perfil().grana; }
     salvar(); fechar(); render();
   };
 }
@@ -3937,37 +4081,54 @@ function renderHabitos(){
   let criadas = 0, batidas = 0, diasGrana = 0;
   dias.forEach(d=>{
     const r = dados.registro[isoDe(d)]; if(!r) return;
-    criadas += (r.metas||[]).length + 1;
-    batidas += (r.metas||[]).filter(m=>m.ok).length + (r.grana?1:0);
+    criadas += (r.metas||[]).length + (temGrana()?1:0);
+    batidas += (r.metas||[]).filter(m=>m.ok).length + (temGrana() && r.grana?1:0);
     if(r.grana) diasGrana++;
   });
   const g = granaDoMes();
-  const pct = Math.min(100, Math.round(g.total/GRANA.mensal*100));
+  const pct = temGrana() ? Math.min(100, Math.round(g.total/GRANA.mensal*100)) : 0;
   let h = '<div class="placar"><div class="placar-num">'+batidas+' <small>de '+criadas+' metas</small></div>'+
     '<p>'+(criadas===0 ? 'Ainda sem metas nos últimos 7 dias. Comece com uma só, hoje.'
       : batidas/criadas >= .7 ? 'Nos últimos 7 dias você bateu a maior parte do que se propôs. Isso é o que “ser mais organizado” parece por dentro.'
       : 'Nos últimos 7 dias você bateu '+batidas+'. Não é pouco: é uma base. Tente subir uma meta por semana, não dez.')+'</p>'+
-    '<div class="placar-div"></div>'+
+    (temGrana() ? '<div class="placar-div"></div>'+
     '<div class="placar-num" style="color:var(--sinal)">'+GRANA.moeda+' '+g.total+' <small>de '+GRANA.mensal+' no mês</small></div>'+
     '<div class="grana-barra" style="margin-top:10px"><i style="width:'+pct+'%"></i></div>'+
     '<p>'+g.dias+' dia'+(g.dias===1?'':'s')+' guardando '+GRANA.moeda+' '+GRANA.diaria+
     '. Faltam '+GRANA.moeda+' '+Math.max(0,GRANA.mensal-g.total)+' pra fechar o mês — '+
-    Math.max(0,Math.ceil((GRANA.mensal-g.total)/GRANA.diaria))+' dias no azul.</p></div>';
+    Math.max(0,Math.ceil((GRANA.mensal-g.total)/GRANA.diaria))+' dias no azul.</p>' : '')+'</div>';
 
+  /* o dia é calculado uma vez e reaproveitado por todos os hábitos (e pela sequência) */
+  const cacheDia = {};
+  const estadoHab = (d, key)=>{
+    const iso = isoDe(d);
+    if(!cacheDia[iso]) cacheDia[iso] = blocosDoDia(d.getDay(), modoDe(iso, d.getDay()), iso);
+    const blocos = cacheDia[iso].filter(b=>b.hab===key);
+    const marcados = (dados.registro[iso]||{feitos:[]}).feitos || [];
+    const aplicavel = blocos.length > 0;
+    return { aplicavel, ok: aplicavel && blocos.some(b=>marcados.includes(b.id)) };
+  };
+  const primeiroRegistro = Object.keys(dados.registro).sort()[0] || hojeISO();
   HABITOS.forEach(hab=>{
     let poss = 0, feito = 0, celulas = "";
     dias.forEach(d=>{
       const iso = isoDe(d);
-      const blocos = blocosDoDia(d.getDay(), modoDe(iso, d.getDay()), iso).filter(b=>b.hab===hab.key);
-      const marcados = (dados.registro[iso]||{feitos:[]}).feitos || [];
-      const aplicavel = blocos.length > 0;
-      const ok = aplicavel && blocos.some(b=>marcados.includes(b.id));
-      if(aplicavel) poss++; if(ok) feito++;
-      celulas += '<div class="dia-ponto '+(ok?"on":"")+(aplicavel?"":" na")+
+      const e = estadoHab(d, hab.key);
+      if(e.aplicavel) poss++; if(e.ok) feito++;
+      celulas += '<div class="dia-ponto '+(e.ok?"on":"")+(e.aplicavel?"":" na")+
         (iso===hojeISO()?" hoje":"")+'">'+CURTO[d.getDay()]+'</div>';
     });
+    /* sequência atual: dias aplicáveis seguidos com o hábito marcado; hoje em aberto não quebra */
+    let seq = 0;
+    for(let k=0;k<60;k++){
+      const d = new Date(hoje); d.setDate(hoje.getDate()-k);
+      if(isoDe(d) < primeiroRegistro) break;
+      const e = estadoHab(d, hab.key);
+      if(!e.aplicavel) continue;
+      if(e.ok) seq++; else if(k === 0) continue; else break;
+    }
     h += '<div class="habito"><div class="habito-topo"><span class="habito-nome">'+hab.nome+'</span>'+
-      '<span class="habito-conta">'+feito+' de '+poss+' dias</span></div>'+
+      '<span class="habito-conta">'+feito+' de '+poss+' dias'+(seq >= 2 ? ' · 🔥 '+seq+' seguidos' : '')+'</span></div>'+
       '<div class="habito-dias">'+celulas+'</div></div>';
   });
   document.getElementById("tela-habitos").innerHTML = h;
@@ -4059,10 +4220,12 @@ function render(){
   document.getElementById("rodape").innerHTML = (tela==="hoje"
     ? 'Toque no horário de um bloco (ou segure o dedo nele) pra mover a atividade ou tirar do dia. '
     : 'Seus dados ficam salvos neste navegador, mesmo fechando a aba. ')
+    + (tela==="hoje" ? '<button id="btnICS">Exportar hoje (.ics)</button> · ' : '')
     + '<button id="btnBackup">Backup e restauração</button>'
     + ' · <button id="btnTutorial">Como funciona</button>'
     + ' · <button id="btnSetup">Refazer minha rotina</button>';
   document.getElementById("btnBackup").onclick = abrirBackup;
+  const bics = document.getElementById("btnICS"); if(bics) bics.onclick = exportarICS;
   document.getElementById("btnTutorial").onclick = ()=> abrirTutorial(0);
   document.getElementById("btnSetup").onclick = ()=>{ rascunho = null; abrirSetup(0); };
 }
@@ -4081,7 +4244,11 @@ const lista = document.getElementById("lista");
 let lpTimer = null, bloqueiaClique = false;
 lista.addEventListener("pointerdown", e=>{
   const it = e.target.closest(".item[data-id]"); if(!it) return;
-  lpTimer = setTimeout(()=>{ lpTimer = null; bloqueiaClique = true; abrirMover(it.dataset.id); }, 480);
+  lpTimer = setTimeout(()=>{
+    lpTimer = null; bloqueiaClique = true; abrirMover(it.dataset.id);
+    /* se o click nunca chegar (o dedo rolou a tela), o próximo toque não pode ficar preso */
+    setTimeout(()=>{ bloqueiaClique = false; }, 700);
+  }, 480);
 });
 ["pointerup","pointercancel","pointerleave","pointermove","scroll"].forEach(ev=>
   lista.addEventListener(ev, ()=>{ if(lpTimer){ clearTimeout(lpTimer); lpTimer = null; } }, {passive:true}));
@@ -4157,6 +4324,7 @@ document.getElementById("btnVoltarAgora").addEventListener("click", ()=>{
     dados.cancelamentos = salvo.cancelamentos || {};
     dados.agenda = salvo.agenda || {};
     dados.dourados = salvo.dourados || {};
+    dados.expedientes = salvo.expedientes || {};
     dados.tutorial = salvo.tutorial !== undefined ? salvo.tutorial : true;
     dados._t = salvo._t || 0;
     if(salvo.perfil) dados.perfil = salvo.perfil;
