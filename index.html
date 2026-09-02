@@ -2263,11 +2263,15 @@ function retrato(dow, modo, iso, patchPor){
 }
 
 /* compara o dia de agora com o dia depois da mudança */
-function comparar(antes, depois){
+/* compara o dia de agora com o dia depois da mudança.
+   `idAlvo` é o bloco que você está editando: encurtá-lo foi o seu pedido, não
+   um efeito colateral, então ele não entra na conta do estrago. */
+function comparar(antes, depois, idAlvo){
   const perdidos = depois.fora.filter(b=>!antes.foraIds.includes(b.id));
   const recuperados = antes.fora.filter(b=>!depois.foraIds.includes(b.id));
   const encurtados = [];
   Object.keys(antes.mapa).forEach(k=>{
+    if(k === idAlvo) return;
     const a = antes.mapa[k], b = depois.mapa[k];
     if(!b || a.id === undefined) return;
     if(b.dur < a.dur - 4) encurtados.push({ titulo:a.titulo, de:a.dur, para:b.dur });
@@ -2284,7 +2288,8 @@ function comparar(antes, depois){
 /* quanto dói: perder um bloco dói muito mais do que encurtar */
 function custo(c){
   if(c.ignorado) return 90000;          // pior que qualquer estrago: simplesmente não acontece
-  return c.choques * 5000
+  return (c.aparado ? (c.aparado.pediu - c.aparado.coube) * 2 : 0)
+    + c.choques * 5000
     + c.perdidos.reduce((s,b)=>s + (b.prio === "opcional" ? 40 : b.prio === "essencial" ? 400 : 160), 0)
     + c.encurtados.reduce((s,e)=>s + (e.de - e.para), 0)
     + Math.max(0, c.sonoDelta) * 3;
@@ -2314,15 +2319,15 @@ function avaliarMudanca(id, patch, escopo, dow, iso, modo){
   };
   const antes = retrato(dow, modo, iso, null);
   const pedido = retrato(dow, modo, iso, por(patch));
-  const cPedido = comparar(antes, pedido);
+  const cPedido = comparar(antes, pedido, id);
   /* Rede de segurança: algumas partes do dia são recalculadas do zero (o expediente,
      por exemplo). Se o pedido não pegou, é melhor dizer isso do que exibir "cabe". */
   const posto = pedido.mapa[id];
   if(!posto) cPedido.ignorado = "sumiu";
   else if(patch.ini && posto.ini !== patch.ini) cPedido.ignorado = "hora";
-  else if(patch.dur && Math.abs(posto.dur - patch.dur) > 4 && !cPedido.encurtados.length)
-    cPedido.ignorado = "duracao";
-  if(cPedido.ignorado) cPedido.limpo = false;
+  else if(patch.dur && posto.dur < patch.dur - 4)
+    cPedido.aparado = { pediu:patch.dur, coube:posto.dur };
+  if(cPedido.ignorado || cPedido.aparado) cPedido.limpo = false;
 
   const opcoes = [];
   const duracao = patch.dur || (antes.mapa[id] ? antes.mapa[id].dur : 30);
@@ -2334,7 +2339,7 @@ function avaliarMudanca(id, patch, escopo, dow, iso, modo){
       if(m === pedida) return;
       const p2 = Object.assign({}, patch, { ini:hhmm(m) });
       const r = retrato(dow, modo, iso, por(p2));
-      const c = comparar(antes, r);
+      const c = comparar(antes, r, id);
       const posto2 = r.mapa[id];
       if(!posto2 || posto2.ini !== p2.ini) return;      // não adianta sugerir o que não pega
       opcoes.push({ tipo:"hora", patch:p2, comp:c, peso:custo(c) + Math.abs(m-pedida)/10,
@@ -2345,8 +2350,8 @@ function avaliarMudanca(id, patch, escopo, dow, iso, modo){
       if(nd < 10 || nd >= duracao) return;
       const p2 = Object.assign({}, patch, { dur:nd });
       const r = retrato(dow, modo, iso, por(p2));
-      const c = comparar(antes, r);
-      if(!r.mapa[id]) return;
+      const c = comparar(antes, r, id);
+      if(!r.mapa[id] || r.mapa[id].dur < nd - 4) return;
       opcoes.push({ tipo:"curto", patch:p2, comp:c, peso:custo(c) + (duracao-nd)/4,
         rotulo:"Manter "+hhmm(pedida)+", mas em "+dur(nd) });
     });
@@ -2372,7 +2377,8 @@ function frasesDoCusto(c){
   const f = [];
   if(c.ignorado === "sumiu") f.push("nesse horário o bloco não existe mais no dia");
   if(c.ignorado === "hora") f.push("o dia não aceita esse bloco nessa hora — ele volta pro lugar de origem");
-  if(c.ignorado === "duracao") f.push("essa duração não cabe aqui");
+  if(c.aparado) f.push("o dia só consegue dar "+dur(c.aparado.coube)+
+    " aqui, não "+dur(c.aparado.pediu));
   if(c.choques > 0) f.push("dois horários fixos passam a se cruzar");
   c.perdidos.forEach(b=>f.push("“"+b.titulo+"” não cabe mais"));
   if(c.encurtados.length === 1)
@@ -2387,6 +2393,7 @@ function frasesDoCusto(c){
 }
 function selo(c){
   if(c.ignorado) return { txt:"não pega", cls:"mv-ruim" };
+  if(c.aparado) return { txt:"sai menor", cls:"mv-medio" };
   if(c.choques > 0) return { txt:"cruza horário fixo", cls:"mv-ruim" };
   if(c.perdidos.length) return { txt:c.perdidos.length+" bloco"+(c.perdidos.length>1?"s":"")+" fora", cls:"mv-ruim" };
   if(c.encurtados.length) return { txt:"aperta o resto", cls:"mv-medio" };
