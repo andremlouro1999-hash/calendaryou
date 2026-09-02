@@ -1316,6 +1316,10 @@ function planoBase(dia, modo, iso){
   /* um almoço movido à mão precisa chegar até aqui, senão a mudança seria ignorada */
   const idAlm = dia+":almoco1";
   const ajAlmoco = normAjuste((reg0.ajustes || {})[idAlm]) || normAjuste((dados.mudancas || {})[idAlm]);
+  /* o expediente decide a que horas você chega ao trabalho olhando o que vem
+     antes dele. "Antes" precisa ser antes no relógio, não antes na lista: sem
+     isto, um bloco movido para a tarde adiaria a chegada para a tarde. */
+  arr.sort(porHorario);
   const trabalho = expandirExpediente(arr, dia, ajAlmoco);
 
   let naoCoube = [], estouro = null;
@@ -1423,9 +1427,18 @@ function fluir(fila, cursor){
 }
 
 /* encaixa o dia inteiro em sequência — nada é tratado como "já passou" */
+/* A ordem em que os blocos entram na fila é a ordem em que o motor os empilha.
+   Mover um bloco muda a ordem do dia — sem reordenar aqui, ele continuaria
+   valendo como parede no lugar antigo e engoliria tudo que viesse depois.
+   Num dia sem nada movido isto não muda nada: a rotina já nasce em ordem. */
+function porHorario(a, b){
+  return a.iniM - b.iniM || (a.ancora ? 0 : 1) - (b.ancora ? 0 : 1);
+}
+
 function normalizar(blocos){
   const out = blocos.map(b=>({...b, ini2:b.iniM, dur2:b.dur, adiado:false, cortado:0, pulado:false, resgatado:false}));
   if(!out.length) return { plano:out, ajustes:[] };
+  out.sort(porHorario);
   return { plano:out, ajustes: fluir(out, out[0].iniM) };
 }
 
@@ -1447,6 +1460,7 @@ function montarPlano(blocos, replanEm, feitos, resgatados){
   });
   // primeiro os resgatados, na ordem que a pessoa arrastou; depois o resto do dia
   resgatados.forEach(id=>{ const b = out.find(x=>x.id===id && x.resgatado); if(b) fila.push(b); });
+  futuros.sort(porHorario);
   futuros.forEach(b=>fila.push(b));
   if(!fila.length) return { plano:out, ajustes:[] };
 
@@ -2381,11 +2395,20 @@ function frasesDoCusto(c){
     " aqui, não "+dur(c.aparado.pediu));
   if(c.choques > 0) f.push("dois horários fixos passam a se cruzar");
   c.perdidos.forEach(b=>f.push("“"+b.titulo+"” não cabe mais"));
-  if(c.encurtados.length === 1)
-    f.push("“"+c.encurtados[0].titulo+"” cai de "+dur(c.encurtados[0].de)+" pra "+dur(c.encurtados[0].para));
-  else if(c.encurtados.length > 1)
-    f.push(c.encurtados.length+" blocos encurtam ("+c.encurtados.slice(0,2).map(e=>e.titulo).join(", ")+
-      (c.encurtados.length>2?"…":"")+")");
+  /* o mesmo bloco pode aparecer partido (o expediente vira dois pedaços);
+     somar por nome evita o "2 blocos encurtam (Trabalho, Trabalho)" */
+  const porNome = {};
+  c.encurtados.forEach(e=>{ porNome[e.titulo] = (porNome[e.titulo] || 0) + (e.de - e.para); });
+  const nomes = Object.keys(porNome);
+  if(nomes.length === 1){
+    const t = nomes[0];
+    f.push(c.encurtados.length === 1
+      ? "“"+t+"” cai de "+dur(c.encurtados[0].de)+" pra "+dur(c.encurtados[0].para)
+      : "“"+t+"” perde "+dur(porNome[t])+" no total");
+  }else if(nomes.length > 1){
+    f.push(nomes.length+" blocos encurtam ("+nomes.slice(0,2).join(", ")+
+      (nomes.length > 2 ? "…" : "")+")");
+  }
   if(c.sonoDelta > 0) f.push("você deita "+dur(c.sonoDelta)+" mais tarde");
   if(c.sonoDelta < 0) f.push("você deita "+dur(-c.sonoDelta)+" mais cedo");
   c.recuperados.forEach(b=>f.push("“"+b.titulo+"” volta a caber"));
